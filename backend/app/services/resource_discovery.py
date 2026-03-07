@@ -258,10 +258,52 @@ async def import_mcp_from_smithery(
         print(f"[ResourceDiscovery] Could not list tools from {server_id}: {e}")
 
     # Step 4: Register in database
+    # Build a base URL WITHOUT config baked in (config is saved to AgentTool.config instead)
+    base_mcp_url = f"{connect_url}?apiKey={api_key}"
+
     async with async_session() as db:
         imported_tools = []
 
+        # Helper: ensure AgentTool link exists and save config
+        async def _ensure_agent_tool(tool_id: uuid.UUID):
+            agent_check = await db.execute(
+                select(AgentTool).where(
+                    AgentTool.agent_id == agent_id,
+                    AgentTool.tool_id == tool_id,
+                )
+            )
+            at = agent_check.scalar_one_or_none()
+            if at:
+                if config:
+                    at.config = {**(at.config or {}), **config}
+            else:
+                db.add(AgentTool(
+                    agent_id=agent_id, tool_id=tool_id, enabled=True,
+                    source="user_installed", installed_by_agent_id=agent_id,
+                    config=config or {},
+                ))
+
+        # On re-import with config: update ALL existing tools for this server
+        if config:
+            existing_server_tools_r = await db.execute(
+                select(Tool).where(Tool.mcp_server_name == display_name, Tool.type == "mcp")
+            )
+            for et in existing_server_tools_r.scalars().all():
+                et.mcp_server_url = base_mcp_url  # refresh URL
+                await _ensure_agent_tool(et.id)
+
         if tools_discovered:
+            # Clean up old generic entry if individual tools are now discovered
+            generic_name = f"mcp_{server_id.replace('/', '_').replace('@', '')}"
+            old_generic_r = await db.execute(select(Tool).where(Tool.name == generic_name))
+            old_generic = old_generic_r.scalar_one_or_none()
+            if old_generic:
+                await db.execute(
+                    AgentTool.__table__.delete().where(AgentTool.tool_id == old_generic.id)
+                )
+                await db.delete(old_generic)
+                await db.flush()
+
             # Create one Tool record per MCP tool
             for mcp_tool in tools_discovered:
                 tool_name = f"mcp_{server_id.replace('/', '_').replace('@', '')}_{mcp_tool['name']}"
@@ -271,23 +313,13 @@ async def import_mcp_from_smithery(
                 existing_r = await db.execute(select(Tool).where(Tool.name == tool_name))
                 existing_tool = existing_r.scalar_one_or_none()
                 if existing_tool:
+                    existing_tool.mcp_server_url = base_mcp_url
+                    await _ensure_agent_tool(existing_tool.id)
                     if config:
-                        # Update connection URL with new config
-                        existing_tool.mcp_server_url = mcp_url
                         imported_tools.append(f"🔄 {tool_display} (config updated)")
                     else:
                         imported_tools.append(f"⏭️ {tool_display} (already imported)")
-                    # Ensure assigned to this agent
-                    agent_check = await db.execute(
-                        select(AgentTool).where(
-                            AgentTool.agent_id == agent_id,
-                            AgentTool.tool_id == existing_tool.id,
-                        )
-                    )
-                    if not agent_check.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=existing_tool.id, enabled=True,
-                                         source="user_installed", installed_by_agent_id=agent_id))
-                    continue  # ← skip creating duplicate Tool record
+                    continue
 
                 tool = Tool(
                     name=tool_name,
@@ -297,7 +329,7 @@ async def import_mcp_from_smithery(
                     category="mcp",
                     icon="🔌",
                     parameters_schema=mcp_tool.get("inputSchema", {"type": "object", "properties": {}}),
-                    mcp_server_url=mcp_url,
+                    mcp_server_url=base_mcp_url,
                     mcp_server_name=display_name,
                     mcp_tool_name=mcp_tool["name"],
                     enabled=True,
@@ -305,10 +337,7 @@ async def import_mcp_from_smithery(
                 )
                 db.add(tool)
                 await db.flush()
-
-                # Assign to requesting agent
-                db.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True,
-                                 source="user_installed", installed_by_agent_id=agent_id))
+                await _ensure_agent_tool(tool.id)
                 imported_tools.append(f"✅ {tool_display}")
         else:
             # Create a single generic tool entry for the server
@@ -318,18 +347,10 @@ async def import_mcp_from_smithery(
             existing_r = await db.execute(select(Tool).where(Tool.name == tool_name))
             existing_tool = existing_r.scalar_one_or_none()
             if existing_tool:
+                existing_tool.mcp_server_url = base_mcp_url
+                await _ensure_agent_tool(existing_tool.id)
                 if config:
-                    existing_tool.mcp_server_url = mcp_url
-                    # Ensure assigned to this agent
-                    agent_check = await db.execute(
-                        select(AgentTool).where(
-                            AgentTool.agent_id == agent_id,
-                            AgentTool.tool_id == existing_tool.id,
-                        )
-                    )
-                    if not agent_check.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=existing_tool.id, enabled=True,
-                                         source="user_installed", installed_by_agent_id=agent_id))
+                    await db.commit()
                     return f"🔄 {tool_display} config updated. The tool is now ready to use."
                 else:
                     return f"⏭️ {tool_display} is already imported."
@@ -342,15 +363,14 @@ async def import_mcp_from_smithery(
                 category="mcp",
                 icon="🔌",
                 parameters_schema={"type": "object", "properties": {}},
-                mcp_server_url=mcp_url,
+                mcp_server_url=base_mcp_url,
                 mcp_server_name=display_name,
                 enabled=True,
                 is_default=False,
             )
             db.add(tool)
             await db.flush()
-            db.add(AgentTool(agent_id=agent_id, tool_id=tool.id, enabled=True,
-                             source="user_installed", installed_by_agent_id=agent_id))
+            await _ensure_agent_tool(tool.id)
             imported_tools.append(f"✅ {tool_display} (tools couldn't be listed — server may need configuration)")
 
         await db.commit()

@@ -944,9 +944,20 @@ async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> s
         # Merge global config + agent override
         merged_config = {**(tool.config or {}), **agent_config}
 
-        # Rebuild MCP URL with merged config if needed
+        # Rebuild MCP URL with merged config
         mcp_url = tool.mcp_server_url
-        if merged_config and "apiKey" in mcp_url:
+        if merged_config and "server.smithery.ai" in mcp_url:
+            # Smithery Connect: inject config as base64-encoded query param
+            import json, base64, urllib.parse
+            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+            parsed = urlparse(mcp_url)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            config_b64 = base64.b64encode(json.dumps(merged_config).encode()).decode()
+            qs["config"] = [urllib.parse.quote(config_b64)]
+            new_query = urlencode({k: v[0] for k, v in qs.items()})
+            mcp_url = urlunparse(parsed._replace(query=new_query))
+        elif merged_config and "apiKey" in mcp_url:
+            # Generic MCP URL with apiKey — try injecting config
             import json, base64, urllib.parse
             from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
             parsed = urlparse(mcp_url)
@@ -962,6 +973,7 @@ async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> s
 
     except Exception as e:
         return f"❌ MCP tool execution error: {str(e)[:200]}"
+
 
 
 def _list_files(ws: Path, rel_path: str) -> str:
