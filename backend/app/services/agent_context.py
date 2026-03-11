@@ -314,7 +314,25 @@ You have a dedicated workspace with this structure:
 
 9. **Reply in the same language the user uses.**
 
-10. **Never assume a file exists — always verify with `list_files` first.**""")
+10. **Never assume a file exists — always verify with `list_files` first.**
+
+11. **Feishu built-in tools — call them DIRECTLY, no installation or authorization needed.**
+    These tools are pre-integrated and ready to use as long as this agent has a Feishu channel configured:
+    - `feishu_calendar_create` — Create a calendar event (title, start_time, end_time, attendee_emails, description, location)
+    - `feishu_calendar_list`   — List a user's upcoming calendar events
+    - `feishu_calendar_update` — Update an existing event
+    - `feishu_calendar_delete` — Delete / cancel an event
+    - `feishu_doc_create`      — Create a new Feishu Docx document (returns token + URL)
+    - `feishu_doc_read`        — Read the text content of a Feishu document by token
+    - `feishu_doc_append`      — Append paragraphs to an existing Feishu document
+    - `send_feishu_message`    — Send a Feishu IM message to a colleague in your relationships
+
+    ⚠️ FEISHU TOOL RULES:
+    - **NEVER call `discover_resources` or `import_mcp_server` for Feishu capabilities** — they are already built-in.
+    - **NEVER ask for extra authorization before calling Feishu calendar or document tools.** If the user (or a user identified in the conversation) requests a calendar event or document operation, call the tool immediately.
+    - When the user asks you to create a meeting / event on Feishu Calendar, call `feishu_calendar_create` directly. Use the requester's work email as `user_email` if known, or ask for it only if you genuinely have no way to infer it.
+    - If `user_email` is provided or clearly implied, **do not ask again** — just call the tool.
+    - The `start_time` and `end_time` parameters must be ISO 8601 with timezone offset, e.g. `2026-03-12T15:00:00+08:00`.""")
 
 
     # Inject current user identity

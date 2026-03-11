@@ -15,7 +15,7 @@ from app.models.llm import LLMModel
 from app.models.user import User
 from app.schemas.schemas import (
     ApprovalAction, ApprovalRequestOut, AuditLogOut, EnterpriseInfoOut,
-    EnterpriseInfoUpdate, LLMModelCreate, LLMModelOut,
+    EnterpriseInfoUpdate, LLMModelCreate, LLMModelOut, LLMModelUpdate
 )
 from app.services.autonomy_service import autonomy_service
 from app.services.enterprise_sync import enterprise_sync_service

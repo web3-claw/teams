@@ -488,13 +488,13 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "feishu_calendar_list",
-            "description": "List calendar events for a user within a time range. Defaults to next 7 days.",
+            "description": "List calendar events within a time range. Defaults to next 7 days. Call this DIRECTLY — no installation needed.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "user_email": {
                         "type": "string",
-                        "description": "User's work email, e.g. 'zhangsan@company.com'",
+                        "description": "Optional: user's work email to list their calendar. If omitted, lists the agent app's own calendar.",
                     },
                     "start_time": {
                         "type": "string",
@@ -509,7 +509,7 @@ AGENT_TOOLS = [
                         "description": "Max events to return (default 20)",
                     },
                 },
-                "required": ["user_email"],
+                "required": [],
             },
         },
     },
@@ -517,21 +517,13 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "feishu_calendar_create",
-            "description": "Create a calendar event for a user, optionally inviting attendees.",
+            "description": "Create a Feishu calendar event. Call this DIRECTLY — no installation or extra authorization needed. If user_email is not provided, the event is created on the agent's own calendar.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "user_email": {
-                        "type": "string",
-                        "description": "Organizer's email",
-                    },
                     "summary": {
                         "type": "string",
                         "description": "Event title",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Event description/agenda",
                     },
                     "start_time": {
                         "type": "string",
@@ -540,6 +532,14 @@ AGENT_TOOLS = [
                     "end_time": {
                         "type": "string",
                         "description": "Event end (ISO 8601), e.g. '2026-03-15T15:00:00+08:00'",
+                    },
+                    "user_email": {
+                        "type": "string",
+                        "description": "Optional: organizer's work email. Used to invite the organizer as an attendee.",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Event description/agenda",
                     },
                     "attendee_emails": {
                         "type": "array",
@@ -555,7 +555,7 @@ AGENT_TOOLS = [
                         "description": "Timezone, e.g. 'Asia/Shanghai'. Defaults to Asia/Shanghai.",
                     },
                 },
-                "required": ["user_email", "summary", "start_time", "end_time"],
+                "required": ["summary", "start_time", "end_time"],
             },
         },
     },
@@ -618,19 +618,36 @@ AGENT_TOOLS = [
 ]
 
 
+# Core tools that should always be available to agents regardless of
+# DB configuration. Feishu tools are included here so that once an
+# agent is bound to a Feishu channel, it can immediately use document
+# and calendar capabilities without requiring extra Tool records.
+_ALWAYS_INCLUDE = {
+    "send_channel_file",
+    "write_file",
+    "send_feishu_message",
+    "feishu_doc_read",
+    "feishu_doc_create",
+    "feishu_doc_append",
+    "feishu_calendar_list",
+    "feishu_calendar_create",
+    "feishu_calendar_update",
+    "feishu_calendar_delete",
+}
+_always_tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _ALWAYS_INCLUDE]
+
+
 # ─── Dynamic Tool Loading from DB ──────────────────────────────
 
 async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     """Load enabled tools for an agent from DB (OpenAI function-calling format).
     
     Falls back to hardcoded AGENT_TOOLS if DB not ready.
-    Always includes core system tools (send_channel_file, write_file) so the agent
-    can deliver files to users via any channel regardless of DB tool configuration.
+    Always includes core system tools (send_channel_file, write_file, Feishu
+    document & calendar helpers) so the agent can deliver files to users via
+    any channel and use Feishu capabilities once configured, regardless of
+    DB tool configuration.
     """
-    # These tool names must always be included (channel delivery + file writing)
-    _ALWAYS_INCLUDE = {"send_channel_file", "write_file"}
-    _always_tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _ALWAYS_INCLUDE]
-
     try:
         from app.models.tool import Tool, AgentTool
 
@@ -2833,16 +2850,32 @@ async def _get_feishu_token(agent_id: uuid.UUID) -> tuple[str, str] | None:
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
-            "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal",
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
             json={"app_id": config.app_id, "app_secret": config.app_secret},
         )
-        token = resp.json().get("app_access_token", "")
+        token = resp.json().get("tenant_access_token", "")
 
     return (config.app_id, token) if token else None
 
 
+async def _get_agent_calendar_id(token: str) -> str | None:
+    """Get the primary calendar ID for the agent app itself."""
+    import httpx
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    data = resp.json()
+    if data.get("code") == 0:
+        cals = data.get("data", {}).get("calendars", [])
+        if cals:
+            return cals[0].get("calendar", {}).get("calendar_id")
+    return None
+
+
 async def _feishu_resolve_open_id(token: str, email: str) -> str | None:
-    """Resolve a user's open_id from their email using app_access_token."""
+    """Resolve a user's open_id from their email."""
     import httpx
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
@@ -3005,17 +3038,21 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
     from datetime import timedelta
 
     user_email = arguments.get("user_email", "").strip()
-    if not user_email:
-        return "❌ Missing required argument 'user_email'"
 
     creds = await _get_feishu_token(agent_id)
     if not creds:
         return "❌ Agent has no Feishu channel configured."
     _, token = creds
 
-    open_id = await _feishu_resolve_open_id(token, user_email)
-    if not open_id:
-        return f"❌ User '{user_email}' not found in Feishu."
+    # user_email is optional — if provided, resolve open_id (but don't block on failure)
+    if user_email:
+        open_id = await _feishu_resolve_open_id(token, user_email)
+        if not open_id:
+            print(f"[Feishu Calendar] Could not resolve open_id for '{user_email}', listing agent calendar")
+
+    agent_cal_id = await _get_agent_calendar_id(token)
+    if not agent_cal_id:
+        return "❌ Failed to retrieve agent's primary calendar ID."
 
     now = datetime.now(timezone.utc)
     start_str = arguments.get("start_time") or now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3024,14 +3061,12 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
 
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.get(
-            "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary/events",
+            f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events",
             headers={"Authorization": f"Bearer {token}"},
             params={
                 "start_time": start_str,
                 "end_time": end_str,
                 "page_size": max_results,
-                "user_id_type": "open_id",
-                "user_id": open_id,
             },
         )
 
@@ -3040,10 +3075,11 @@ async def _feishu_calendar_list(agent_id: uuid.UUID, arguments: dict) -> str:
         return f"❌ Calendar API error: {data.get('msg')} (code {data.get('code')})"
 
     items = data.get("data", {}).get("items", [])
+    label = user_email or "agent"
     if not items:
-        return f"📅 No events for {user_email} in this period."
+        return f"📅 No events for {label} in this period."
 
-    lines = [f"📅 **{user_email}'s calendar** ({len(items)} events):\n"]
+    lines = [f"📅 **{label}'s calendar** ({len(items)} events):\n"]
     for ev in items:
         summary = ev.get("summary", "(no title)")
         start = ev.get("start_time", {}).get("timestamp", "")
@@ -3070,8 +3106,7 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
     start_time = arguments.get("start_time", "").strip()
     end_time = arguments.get("end_time", "").strip()
 
-    for f, v in [("user_email", user_email), ("summary", summary),
-                 ("start_time", start_time), ("end_time", end_time)]:
+    for f, v in [("summary", summary), ("start_time", start_time), ("end_time", end_time)]:
         if not v:
             return f"❌ Missing required argument '{f}'"
 
@@ -3080,9 +3115,16 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
         return "❌ Agent has no Feishu channel configured."
     _, token = creds
 
-    open_id = await _feishu_resolve_open_id(token, user_email)
-    if not open_id:
-        return f"❌ User '{user_email}' not found in Feishu."
+    # Resolve organizer open_id — soft failure: proceed without invite if not found
+    organizer_open_id: str | None = None
+    if user_email:
+        organizer_open_id = await _feishu_resolve_open_id(token, user_email)
+        if not organizer_open_id:
+            print(f"[Feishu Calendar] Could not resolve open_id for '{user_email}', continuing without organizer invite")
+
+    agent_cal_id = await _get_agent_calendar_id(token)
+    if not agent_cal_id:
+        return "❌ Failed to retrieve agent's primary calendar ID."
 
     tz = arguments.get("timezone", "Asia/Shanghai")
     body: dict = {
@@ -3097,10 +3139,9 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
 
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
-            "https://open.feishu.cn/open-apis/calendar/v4/calendars/primary/events",
+            f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events",
             json=body,
             headers={"Authorization": f"Bearer {token}"},
-            params={"user_id_type": "open_id", "user_id": open_id},
         )
 
     data = resp.json()
@@ -3109,18 +3150,21 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
 
     event_id = data.get("data", {}).get("event", {}).get("event_id", "")
 
-    # Invite attendees
-    attendee_emails = arguments.get("attendee_emails", [])
+    # Invite attendees — merge user_email + extra attendee_emails
+    attendee_emails: list[str] = list(arguments.get("attendee_emails") or [])
+    if user_email and user_email not in attendee_emails:
+        attendee_emails.append(user_email)
+
     if attendee_emails and event_id:
         async with httpx.AsyncClient(timeout=20) as client:
             for email in attendee_emails[:20]:
                 aid = await _feishu_resolve_open_id(token, email)
                 if aid:
                     await client.post(
-                        f"https://open.feishu.cn/open-apis/calendar/v4/calendars/primary/events/{event_id}/attendees",
+                        f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events/{event_id}/attendees",
                         json={"attendees": [{"type": "user", "user_id": aid}]},
                         headers={"Authorization": f"Bearer {token}"},
-                        params={"user_id_type": "open_id", "user_id": open_id},
+                        params={"user_id_type": "open_id"},
                     )
 
     att_str = f"\n**Attendees**: {', '.join(attendee_emails)}" if attendee_emails else ""
@@ -3149,6 +3193,10 @@ async def _feishu_calendar_update(agent_id: uuid.UUID, arguments: dict) -> str:
     if not open_id:
         return f"❌ User '{user_email}' not found."
 
+    agent_cal_id = await _get_agent_calendar_id(token)
+    if not agent_cal_id:
+        return "❌ Failed to retrieve agent's primary calendar ID."
+
     patch: dict = {}
     tz = arguments.get("timezone", "Asia/Shanghai")
     if arguments.get("summary"):
@@ -3167,10 +3215,9 @@ async def _feishu_calendar_update(agent_id: uuid.UUID, arguments: dict) -> str:
 
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.patch(
-            f"https://open.feishu.cn/open-apis/calendar/v4/calendars/primary/events/{event_id}",
+            f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events/{event_id}",
             json=patch,
             headers={"Authorization": f"Bearer {token}"},
-            params={"user_id_type": "open_id", "user_id": open_id},
         )
 
     data = resp.json()
@@ -3197,11 +3244,14 @@ async def _feishu_calendar_delete(agent_id: uuid.UUID, arguments: dict) -> str:
     if not open_id:
         return f"❌ User '{user_email}' not found."
 
+    agent_cal_id = await _get_agent_calendar_id(token)
+    if not agent_cal_id:
+        return "❌ Failed to retrieve agent's primary calendar ID."
+
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.delete(
-            f"https://open.feishu.cn/open-apis/calendar/v4/calendars/primary/events/{event_id}",
+            f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events/{event_id}",
             headers={"Authorization": f"Bearer {token}"},
-            params={"user_id_type": "open_id", "user_id": open_id},
         )
 
     data = resp.json()

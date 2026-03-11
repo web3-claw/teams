@@ -240,6 +240,16 @@ class LLMModelCreate(BaseModel):
     enabled: bool = True
     supports_vision: bool = False
 
+class LLMModelUpdate(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    label: str | None = None
+    max_tokens_per_day: int | None = None
+    enabled: bool | None = None
+    supports_vision: bool | None = None
+
 
 class LLMModelOut(BaseModel):
     id: uuid.UUID

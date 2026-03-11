@@ -38,8 +38,33 @@ class FeishuWSManager:
                     if isinstance(data, dict):
                         body_dict = data
                     else:
-                        logger.warning(f"[Feishu WS] Unexpected event data type: {type(data)}")
-                        return
+                        # Handle lark_oapi.event.custom.CustomizedEvent
+                        body_dict = {}
+                        if hasattr(data, "header"):
+                            header_obj = data.header
+                            body_dict["header"] = vars(header_obj) if hasattr(header_obj, "__dict__") else {
+                                "event_type": getattr(header_obj, "event_type", "im.message.receive_v1"),
+                                "event_id": getattr(header_obj, "event_id", ""),
+                                "create_time": getattr(header_obj, "create_time", "")
+                            }
+                            # Ensure event_type is present as it's required downstream
+                            if "event_type" not in body_dict["header"]:
+                                body_dict["header"]["event_type"] = getattr(header_obj, "event_type", "im.message.receive_v1")
+                        else:
+                            body_dict["header"] = {"event_type": "im.message.receive_v1"}
+
+                        if hasattr(data, "event"):
+                            body_dict["event"] = data.event
+                        elif hasattr(data, "content") and isinstance(getattr(data, "content"), str):
+                            import json
+                            try:
+                                body_dict["event"] = json.loads(data.content)
+                            except json.JSONDecodeError:
+                                body_dict["event"] = {"content": data.content}
+                        
+                        if not hasattr(data, "header") and not hasattr(data, "event"):
+                            logger.warning(f"[Feishu WS] Unexpected event data type with no recognizable fields: {type(data)}")
+                            return
                 else:
                     body_dict = json.loads(raw_body.decode("utf-8"))
 
@@ -71,8 +96,32 @@ class FeishuWSManager:
                 if isinstance(data, dict):
                     body_dict = data
                 else:
-                    logger.warning(f"[Feishu WS] Unexpected event data type: {type(data)}")
-                    return
+                    # Handle lark_oapi.event.custom.CustomizedEvent
+                    body_dict = {}
+                    if hasattr(data, "header"):
+                        header_obj = data.header
+                        body_dict["header"] = vars(header_obj) if hasattr(header_obj, "__dict__") else {
+                            "event_type": getattr(header_obj, "event_type", "im.message.receive_v1"),
+                            "event_id": getattr(header_obj, "event_id", ""),
+                            "create_time": getattr(header_obj, "create_time", "")
+                        }
+                        if "event_type" not in body_dict["header"]:
+                            body_dict["header"]["event_type"] = getattr(header_obj, "event_type", "im.message.receive_v1")
+                    else:
+                        body_dict["header"] = {"event_type": "im.message.receive_v1"}
+
+                    if hasattr(data, "event"):
+                        body_dict["event"] = data.event
+                    elif hasattr(data, "content") and isinstance(getattr(data, "content"), str):
+                        import json
+                        try:
+                            body_dict["event"] = json.loads(data.content)
+                        except json.JSONDecodeError:
+                            body_dict["event"] = {"content": data.content}
+                    
+                    if not hasattr(data, "header") and not hasattr(data, "event"):
+                        logger.warning(f"[Feishu WS] Unexpected event data type with no recognizable fields: {type(data)}")
+                        return
             else:
                 body_dict = json.loads(raw_body.decode("utf-8"))
 
